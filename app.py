@@ -2,10 +2,10 @@ import os
 import sqlite3
 import uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import pandas as pd
 from text_extraction import pdf_to_images, rotate_and_save_image_if_needed, ocr_to_csv, process_dataframe
-from summarize import pdf_to_corrected_images, extract_text_from_images, question_text, json_to_dataframe
+from summarize_error import pdf_to_corrected_images, extract_text_from_images, question_text, json_to_dataframe
 
 app = FastAPI()
 
@@ -24,20 +24,21 @@ def init_db():
                 filename TEXT UNIQUE,
                 upload_path TEXT,
                 images_path TEXT,
-                text_path TEXT
+                text_path TEXT,
+                output_xlsx_path TEXT
             )
         ''')
         conn.commit()
 
 init_db()
 
-def save_pdf_to_db(filename, upload_path, images_path, text_path):
+def save_pdf_to_db(filename, upload_path, images_path, text_path, output_xlsx_path):
     with sqlite3.connect(DATABASE) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO pdf_files (filename, upload_path, images_path, text_path)
-            VALUES (?, ?, ?, ?)
-        ''', (filename, upload_path, images_path, text_path))
+            INSERT OR IGNORE INTO pdf_files (filename, upload_path, images_path, text_path, output_xlsx_path)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (filename, upload_path, images_path, text_path, output_xlsx_path))
         conn.commit()
 
 def get_pdf_info(filename):
@@ -47,29 +48,34 @@ def get_pdf_info(filename):
             SELECT * FROM pdf_files WHERE filename = ?
         ''', (filename,))
         return cursor.fetchone()
+    
+
 
 @app.post("/upload_pdf/")
 async def upload_pdf(file: UploadFile = File(...), action: str = Form(...)):
     if not(file.filename.endswith(".pdf") or file.filename.endswith(".PDF")):
         raise HTTPException(status_code=400, detail="Invalid file type. Only PDF files are accepted.")
 
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, file.filename)
+    unique_id = str(uuid.uuid4().hex)
+    base_dir = os.path.join("uploads", unique_id)
+    os.makedirs(base_dir, exist_ok=True)
 
+    # Define paths
+    file_path = os.path.join(base_dir, file.filename)
+    images_dir = os.path.join(base_dir, "images")
+    text_output_folder = os.path.join(base_dir, "texts")
+    output_xlsx_path = os.path.join(base_dir, "output.xlsx")
+
+    # Create necessary directories
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(text_output_folder, exist_ok=True)
+
+    # Save uploaded PDF
     with open(file_path, "wb") as f:
         f.write(file.file.read())
 
-    # Use a different directory for images
-    images_dir = os.path.join(upload_dir, "images")
-    os.makedirs(images_dir, exist_ok=True)
-
-    # Use a different directory for text outputs
-    text_output_folder = os.path.join(upload_dir, "texts")
-    os.makedirs(text_output_folder, exist_ok=True)
-
-    if action == "text_extraction":
-        try:
+    try:
+        if action == "text_extraction":
             # Convert PDF to images
             image_paths = pdf_to_images(file_path, images_dir)
 
@@ -83,24 +89,26 @@ async def upload_pdf(file: UploadFile = File(...), action: str = Form(...)):
                 csv_file_paths.append(csv_file_path)
 
             # Convert CSVs to XLSX
-            xlsx_file_path = os.path.join(upload_dir, "output.xlsx")
-            with pd.ExcelWriter(xlsx_file_path) as writer:
+            with pd.ExcelWriter(output_xlsx_path) as writer:
                 for csv_file_path in csv_file_paths:
                     df = pd.read_csv(csv_file_path, header=None)
                     df = process_dataframe(df)
                     sheet_name = os.path.basename(csv_file_path).replace(".csv", "")
                     df.to_excel(writer, index=False, header=False, sheet_name=sheet_name)
 
-            return FileResponse(xlsx_file_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename="output.xlsx")
+            # Save paths to the database
+            save_pdf_to_db(file.filename, file_path, images_dir, text_output_folder, output_xlsx_path)
 
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            return JSONResponse(
+                content={"detail": "Processing completed successfully", "download_url": f"/download/{unique_id}"},
+                status_code=200
+            )
 
-    elif action == "summarized_extraction":
-        try:
+        elif action == "summarized_extraction":
             image_paths = pdf_to_images(file_path, images_dir)
             extract_text_from_images(image_paths, output_folder=text_output_folder)
 
+       
             query_template = """
 I am providing you an excel file, multiple sheets are there. Read those sheets and
 extract the following information:
@@ -177,9 +185,23 @@ For Example:
                         if df is not None:
                             all_data = pd.concat([all_data, df], ignore_index=True)
 
-            output_xlsx_path = os.path.join(upload_dir, "output.xlsx")
             all_data.to_excel(output_xlsx_path, index=False)
-            return FileResponse(output_xlsx_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename="output.xlsx")
+
+            # Save paths to the database
+            save_pdf_to_db(file.filename, file_path, images_dir, text_output_folder, output_xlsx_path)
+
+            return JSONResponse(
+                content={"detail": "Processing completed successfully", "download_url": f"/download/{unique_id}"},
+                status_code=200
+            )
             
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download/{unique_id}")
+async def download_file(unique_id: str):
+    base_dir = os.path.join("uploads", unique_id)
+    output_xlsx_path = os.path.join(base_dir, "output.xlsx")
+    if not os.path.exists(output_xlsx_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(output_xlsx_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename="output.xlsx")
